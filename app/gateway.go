@@ -216,7 +216,7 @@ func NewGatewayRouter(ctx context.Context, cfg GateRouterConfig) *http.ServeMux 
 	httpClient := http.DefaultClient
 
 	vendingMachineRepo := NewVendingMachineRepo(databasePool)
-	eventBrokerClient := NewEventBrokerClient(httpClient, cfg.EventBrokerHost, cfg.EventBrokerBaseURL)
+	eventBrokerClient := NewEventsBrokerClient(httpClient, cfg.EventBrokerHost, cfg.EventBrokerBaseURL)
 	eventsListener := NewEventsListener(eventBrokerClient)
 
 	go func() {

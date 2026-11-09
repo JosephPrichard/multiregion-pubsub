@@ -13,14 +13,14 @@ import (
 	"github.com/gorilla/websocket"
 )
 
-type EventsBrokerRemoteClient struct {
+type EventBrokerClient struct {
 	http               *http.Client
 	eventBrokerHost    string
 	eventBrokerBaseURL string
 }
 
-func NewEventsBrokerRemoteClient(httpClient *http.Client, eventBrokerHost string, eventBrokerBaseURL string) EventsBrokerRemoteClient {
-	return EventsBrokerRemoteClient{http: httpClient, eventBrokerHost: eventBrokerHost, eventBrokerBaseURL: eventBrokerBaseURL}
+func NewEventsBrokerClient(httpClient *http.Client, eventBrokerHost string, eventBrokerBaseURL string) *EventBrokerClient {
+	return &EventBrokerClient{http: httpClient, eventBrokerHost: eventBrokerHost, eventBrokerBaseURL: eventBrokerBaseURL}
 }
 
 const (
@@ -38,7 +38,7 @@ type PublishEventRemoteBody struct {
 	Payload any    `json:"payload"`
 }
 
-func (client *EventsBrokerRemoteClient) PublishVendingMachineEvent(ctx context.Context, event VendingMachineEvent) error {
+func (client *EventBrokerClient) PublishEvent(ctx context.Context, event VendingMachineEvent) error {
 	requestBody, err := json.Marshal(PublishEventRemoteBody{
 		Channel: VendingMachineEventsChannelName,
 		Payload: event,
@@ -70,7 +70,7 @@ func (client *EventsBrokerRemoteClient) PublishVendingMachineEvent(ctx context.C
 	return nil
 }
 
-func (client *EventsBrokerRemoteClient) SubscribeVendingMachineEvents() (chan VendingMachineEvent, error) {
+func (client *EventBrokerClient) SubscribeEvents() (chan VendingMachineEvent, error) {
 	endpoint := url.URL{Scheme: "ws", Host: client.eventBrokerHost, Path: fmt.Sprintf("%s/subscribe", client.eventBrokerBaseURL)}
 
 	conn, _, err := websocket.DefaultDialer.Dial(endpoint.String(), nil)
