@@ -20,14 +20,16 @@ import (
 // OrderComplete   ---(after a 5s delay)--------> Idle
 // the the following REST API implements the above state machine, with some small validations per state transition
 type GatewayServer struct {
-	vendingMachineRepo VendingMachineRepo
-	eventBrokersRemote EventsBrokerRemoteClient
+	vendingMachineRepo *VendingMachineRepo
+	eventBrokersRemote *EventBrokerClient
+	eventsListener     *EventsListener
 }
 
-func NewGatewayServer(vendingMachineRepo VendingMachineRepo, eventBrokersRemote EventsBrokerRemoteClient) GatewayServer {
+func NewGatewayServer(vendingMachineRepo *VendingMachineRepo, eventBrokersRemote *EventBrokerClient, eventsListener *EventsListener) GatewayServer {
 	return GatewayServer{
 		vendingMachineRepo: vendingMachineRepo,
 		eventBrokersRemote: eventBrokersRemote,
+		eventsListener:     eventsListener,
 	}
 }
 
@@ -119,6 +121,13 @@ func (s *GatewayServer) BuyVendingMachineProduct(_ http.ResponseWriter, r *http.
 	}
 
 	// if successful, block the current thread until we get a signal that the payment has arrived
+	oneshotChan := s.eventsListener.Subscribe(vendingMachineID)
+	select {
+	case event := <-oneshotChan:
+		slog.InfoContext(ctx, "buy vending machine product: received payment event", "event", event)
+	case <-ctx.Done():
+		return &RestResponse{Payload: ServiceResponse{Message: ctx.Err().Error()}, Status: http.StatusRequestTimeout}
+	}
 
 	// select the new state of the vending machine (with the product we tried to buy removed)
 	vendingMachine, err := s.vendingMachineRepo.GetVendingMachine(ctx, vendingMachineID)
@@ -160,7 +169,7 @@ func (s *GatewayServer) DoVendingMachinePayment(w http.ResponseWriter, r *http.R
 
 	go func() {
 		event := VendingMachineEvent{VendingMachineID: vendingMachineID, EventKind: PaymentEventKind}
-		err := s.eventBrokersRemote.PublishVendingMachineEvent(context.WithoutCancel(ctx), event)
+		err := s.eventBrokersRemote.PublishEvent(context.WithoutCancel(ctx), VendingMachineEventsChannelName, event)
 		if err != nil {
 			slog.ErrorContext(ctx, "failed to publish payment event to events broker", "error", err)
 		}
@@ -172,7 +181,7 @@ func (s *GatewayServer) DoVendingMachinePayment(w http.ResponseWriter, r *http.R
 		return &RestResponse{Error: InternalServerError, Status: http.StatusInternalServerError}
 	}
 
-	return &RestResponse{Payload: vendingMachine, Status: http.StatusInternalServerError}
+	return &RestResponse{Payload: DoVendingMachinePaymentResp{Message: "OK", VendingMachine: &vendingMachine}, Status: http.StatusOK}
 }
 
 func (s *GatewayServer) doUpdate(ctx context.Context, vendingMachineID string, state string) *RestResponse {
@@ -207,7 +216,8 @@ func NewGatewayRouter(ctx context.Context, cfg GateRouterConfig) *http.ServeMux 
 	httpClient := http.DefaultClient
 
 	vendingMachineRepo := NewVendingMachineRepo(databasePool)
-	eventBrokersRemote := NewEventsBrokerRemoteClient(httpClient, cfg.EventBrokerHost, cfg.EventBrokerBaseURL)
+	eventBrokerClient := NewEventBrokerClient(httpClient, cfg.EventBrokerHost, cfg.EventBrokerBaseURL)
+	eventsListener := NewEventsListener(eventBrokerClient)
 
 	go func() {
 		// just set the entire schema every single time we start the app, I am way too lazy to set up Goose
@@ -215,7 +225,9 @@ func NewGatewayRouter(ctx context.Context, cfg GateRouterConfig) *http.ServeMux 
 		slog.InfoContext(ctx, "executed create schema", "error", err, "commandTag", commandTag)
 	}()
 
-	server := NewGatewayServer(vendingMachineRepo, eventBrokersRemote)
+	go eventsListener.Listen()
+
+	server := NewGatewayServer(vendingMachineRepo, eventBrokerClient, eventsListener)
 
 	mux := http.NewServeMux()
 

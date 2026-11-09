@@ -1,30 +1,34 @@
 package main
 
 import (
+	"log/slog"
 	"sync"
+	"time"
 )
 
 type EventsListener struct {
 	lock             sync.Mutex
 	eventSubscribers map[string][]chan VendingMachineEvent
 
-	eventsBrokerRemote EventsBrokerRemoteClient
+	eventsBrokerRemote *EventBrokerClient
 }
 
-func NewEventsListener(eventsBrokerRemote EventsBrokerRemoteClient) EventsListener {
-	return EventsListener{eventSubscribers: make(map[string][]chan VendingMachineEvent), eventsBrokerRemote: eventsBrokerRemote}
+func NewEventsListener(eventsBrokerRemote *EventBrokerClient) *EventsListener {
+	return &EventsListener{eventSubscribers: make(map[string][]chan VendingMachineEvent), eventsBrokerRemote: eventsBrokerRemote}
 }
 
 // Listen starts a background task to subscribe to all channels and re-publish them to the subscribers in the listener table
-func (listener *EventsListener) Listen() error {
-	recvChan, err := listener.eventsBrokerRemote.SubscribeVendingMachineEvents()
-	if err != nil {
-		return err
+func (listener *EventsListener) Listen() {
+	for range time.NewTicker(time.Second).C {
+		recvChan, err := listener.eventsBrokerRemote.SubscribeEvents()
+		if err != nil {
+			slog.Error("failed to subscribe to event broker", "error", err)
+			continue
+		}
+		for event := range recvChan {
+			listener.publish(event.VendingMachineID, event)
+		}
 	}
-	for event := range recvChan {
-		listener.publish(event.VendingMachineID, event)
-	}
-	return nil
 }
 
 // publish notify all subscribers to a vendingMachineID event by sending on each mailbox and then closing them

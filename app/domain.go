@@ -16,8 +16,8 @@ type VendingMachineRepo struct {
 	database *pgxpool.Pool
 }
 
-func NewVendingMachineRepo(database *pgxpool.Pool) VendingMachineRepo {
-	return VendingMachineRepo{database: database}
+func NewVendingMachineRepo(database *pgxpool.Pool) *VendingMachineRepo {
+	return &VendingMachineRepo{database: database}
 }
 
 var VendingMachineSchema = `
