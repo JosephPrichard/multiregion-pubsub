@@ -1,2 +1,2 @@
-# multiregion-pubsub
-Proof of concept demonstrating pubsub for a multiregion microservice architecture
+# MultiRegion PubSub
+Proof of concept demonstrating pubsub for a multi-region microservice architecture
