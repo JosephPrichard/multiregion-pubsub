@@ -1,4 +1,4 @@
-package main
+package app
 
 import (
 	"context"
@@ -79,16 +79,17 @@ func rest(h func(w http.ResponseWriter, r *http.Request) *RestResponse) http.Han
 
 		response := h(w, r)
 
-		if response != nil {
-			if response.Payload == nil {
-				if response.Error != nil {
-					response.Payload = ServiceResponse{Message: "FAIL"}
-				} else {
-					response.Payload = ServiceResponse{Message: "OK"}
-				}
-			}
-			writeJSON(ctx, w, response.Payload, response.Status)
-			slog.InfoContext(ctx, "handled REST call", "error", response.Error, "path", r.URL.Path, "timeTaken", time.Since(start).String())
+		if response == nil {
+			return
 		}
+
+		err, isError := response.Payload.(error)
+		if isError {
+			response.Payload = ServiceResponse{Message: "Error: " + err.Error()}
+		}
+
+		writeJSON(ctx, w, response.Payload, response.Status)
+
+		slog.InfoContext(ctx, "handled REST call", "error", response.Error, "path", r.URL.Path, "timeTaken", time.Since(start).String())
 	}
 }
