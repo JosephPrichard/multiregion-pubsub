@@ -54,7 +54,7 @@ func writeJSON[V any](ctx context.Context, w http.ResponseWriter, data V, status
 	}
 }
 
-type RestResponse struct {
+type Response struct {
 	Payload any   `json:"payload"`
 	Error   error `json:"error"`
 	Status  int   `json:"status"`
@@ -64,7 +64,7 @@ type ServiceResponse struct {
 	Message string `json:"message"`
 }
 
-func rest(h func(w http.ResponseWriter, r *http.Request) *RestResponse) http.HandlerFunc {
+func rest(h func(w http.ResponseWriter, r *http.Request) Response) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx := r.Context()
 		start := time.Now()
@@ -78,10 +78,6 @@ func rest(h func(w http.ResponseWriter, r *http.Request) *RestResponse) http.Han
 		slog.InfoContext(ctx, "received REST call", "method", r.Method, "path", r.URL.Path, "url", r.URL.String(), "headers", r.Header)
 
 		response := h(w, r)
-
-		if response == nil {
-			return
-		}
 
 		err, isError := response.Payload.(error)
 		if isError {

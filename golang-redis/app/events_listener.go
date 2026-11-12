@@ -5,6 +5,7 @@ import (
 	"encoding/json/jsontext"
 	"encoding/json/v2"
 	"log/slog"
+	"slices"
 	"sync"
 	"time"
 
@@ -13,14 +14,16 @@ import (
 
 type EventsListener struct {
 	lock             sync.Mutex
-	eventSubscribers map[string][]chan OutputEvent
+	eventSubscribers map[string][]Subscriber
 
 	redisClient redis.UniversalClient
 }
 
 const (
-	ChannelName      = "vending-machine-events"
-	PaymentEventKind = "payment"
+	EventsChannelName = "vending-machine-events"
+	StateChangeEvent  = "state-change"
+
+	SlowSubscriberThreshold = time.Second * 5
 )
 
 type OutputEvent struct {
@@ -29,15 +32,30 @@ type OutputEvent struct {
 	Payload          jsontext.Value `json:"payload"`
 }
 
+func (o OutputEvent) AsVendingMachineEvent() *VendingMachine {
+	var state VendingMachine
+	err := json.Unmarshal(o.Payload, &state)
+	if err != nil {
+		slog.Error("unable to unmarshal vending machine event", "error", err, "event", o)
+		return nil
+	}
+	return &state
+}
+
+type Subscriber struct {
+	lastSendTime time.Time
+	mailbox      chan OutputEvent
+}
+
 func NewEventsListener(redisClient redis.UniversalClient) *EventsListener {
-	return &EventsListener{eventSubscribers: make(map[string][]chan OutputEvent), redisClient: redisClient}
+	return &EventsListener{eventSubscribers: make(map[string][]Subscriber), redisClient: redisClient}
 }
 
 // Listen starts a background task to subscribe to all channels and re-publish them to the subscribers in the listener table
 func (listener *EventsListener) Listen(ctx context.Context) {
 	for {
 		func() {
-			pubsub := listener.redisClient.Subscribe(ChannelName)
+			pubsub := listener.redisClient.Subscribe(EventsChannelName)
 			defer pubsub.Close()
 			recvChan := pubsub.Channel()
 
@@ -48,7 +66,7 @@ func (listener *EventsListener) Listen(ctx context.Context) {
 					slog.Error("failed to deserialize pubsub message - skipping", "payload", message.Payload)
 					break
 				}
-				slog.Info("received a pubsub message", "payload", message.Payload)
+				slog.Info("received a pubsub message", "payload", message.Payload, "event", event)
 				listener.publish(event.VendingMachineID, event)
 			case <-ctx.Done():
 				slog.Info("stopped listening to pubsub messages", "error", ctx.Err())
@@ -66,28 +84,77 @@ func (listener *EventsListener) publish(vendingMachineID string, event OutputEve
 	listener.lock.Lock()
 
 	subscribers := listener.eventSubscribers[vendingMachineID]
-	for _, subscriber := range subscribers {
-		subscriber <- event
-		close(subscriber)
+
+	var indicesToRemove []int
+
+	for index, subscriber := range subscribers {
+		select {
+		case subscriber.mailbox <- event:
+		default:
+			// don't block in case of back-pressure (slow consumer), just drop
+			// if we had to drop AND it has been awhile since the last send was successful, mark this subscriber for removal
+			if time.Now().Sub(subscriber.lastSendTime) > SlowSubscriberThreshold {
+				indicesToRemove = append(indicesToRemove, index)
+			}
+		}
+		// only close one-shot channels early, other subscribes are either expired or are closed explicitly by client
+		if cap(subscriber.mailbox) == 1 {
+			indicesToRemove = append(indicesToRemove, index)
+		}
 	}
-	delete(listener.eventSubscribers, vendingMachineID)
+
+	for indexToRemove := range indicesToRemove {
+		close(subscribers[indexToRemove].mailbox)
+	}
+	for indexToRemove := range indicesToRemove {
+		subscribers = slices.Delete(subscribers, indexToRemove, 1)
+	}
+
+	listener.eventSubscribers[vendingMachineID] = subscribers
 
 	listener.lock.Unlock()
 }
 
-// Subscribe subscribes to an event by vendingMachineID by using a buffered channel as a mailbox.
-// mailboxes are "send once" and are removed from the table once consumed.
-// since they are buffered, we don't need to explicitly remove them (they will not block if no one is on the other side).
-func (listener *EventsListener) Subscribe(vendingMachineID string) chan OutputEvent {
-	oneShotChan := make(chan OutputEvent, 1)
+// DefaultChannelCapacity this is the buffer size until a consumer is "slow" and starts missing messages
+const DefaultChannelCapacity = 16
+
+// Subscribe subscribes to an event broker by vendingMachineID by using a buffered channel as a mailbox
+// if the buffer size is one, mailboxes are "send once" and are removed from the table once consumed.
+func (listener *EventsListener) Subscribe(vendingMachineID string, isOneshotChannel bool) chan OutputEvent {
+	channelCapacity := DefaultChannelCapacity
+	if isOneshotChannel {
+		channelCapacity = 1
+	}
+
+	mailbox := make(chan OutputEvent, channelCapacity)
+	subscriber := Subscriber{lastSendTime: time.Now(), mailbox: mailbox}
 
 	listener.lock.Lock()
 
 	subscribers := listener.eventSubscribers[vendingMachineID]
-	subscribers = append(subscribers, oneShotChan)
+	subscribers = append(subscribers, subscriber)
 	listener.eventSubscribers[vendingMachineID] = subscribers
 
 	listener.lock.Unlock()
 
-	return oneShotChan
+	return mailbox
+}
+
+// Unsubscribe unsubscribes from an event broker by vendingMachineID and channel address
+func (listener *EventsListener) Unsubscribe(vendingMachineID string, mailbox chan OutputEvent) {
+	listener.lock.Lock()
+
+	subscribers := listener.eventSubscribers[vendingMachineID]
+
+	isEqual := func(s Subscriber) bool { return s.mailbox == mailbox }
+
+	index := slices.IndexFunc(subscribers, isEqual)
+	if index >= 0 {
+		close(mailbox)
+	}
+	subscribers = slices.Delete(subscribers, index, 1)
+
+	listener.eventSubscribers[vendingMachineID] = subscribers
+
+	listener.lock.Unlock()
 }

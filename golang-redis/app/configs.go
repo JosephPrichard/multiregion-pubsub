@@ -14,6 +14,31 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
+type InfraConfig struct {
+	DatabaseConnURI string
+	RedisNodeURIs   []string // list of all Redis node URIs to publish to, the 1st one should be the node we will subscribe from
+	AwsRegion       string
+}
+
+func NewDatabaseClients(ctx context.Context, cfg InfraConfig) DatabaseClients {
+	if len(cfg.RedisNodeURIs) == 0 {
+		slog.Error("requires at least one redis node in config", "redisNodeURIs", cfg.RedisNodeURIs)
+		os.Exit(1)
+	}
+
+	stderrHandler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo})
+	slog.SetDefault(slog.New(NewLogRecordHandler("VendingMachinesService", stderrHandler)))
+
+	databasePool := NewDatabasePool(ctx, cfg.DatabaseConnURI, cfg.AwsRegion)
+
+	var redisClients []redis.UniversalClient
+	for _, redisNodeURI := range cfg.RedisNodeURIs {
+		redisClients = append(redisClients, NewRedisClient(redisNodeURI))
+	}
+
+	return DatabaseClients{DatabasePool: databasePool, RedisClients: redisClients}
+}
+
 func NewDatabasePool(ctx context.Context, databaseConnURL string, awsRegion string) *pgxpool.Pool {
 	pgPoolConfig, err := pgxpool.ParseConfig(databaseConnURL)
 	if err != nil {

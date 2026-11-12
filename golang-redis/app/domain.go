@@ -1,83 +1,100 @@
 package app
 
 import (
-	"context"
-	_ "embed"
-	"errors"
 	"fmt"
-	"log/slog"
 	"slices"
 	"time"
-	"uuid"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
-	"github.com/jackc/pgx/v5/pgxpool"
-	"golang.org/x/sync/errgroup"
 )
-
-type VendingMachineRepo struct {
-	database *pgxpool.Pool
-}
-
-func NewVendingMachineRepo(database *pgxpool.Pool) *VendingMachineRepo {
-	return &VendingMachineRepo{database: database}
-}
-
-//go:embed schema.sql
-var VendingMachineSchema string
 
 type VendingMachine struct {
-	ID                    string    `json:"id"`
-	State                 string    `json:"state"`
-	LastUpdatedTimestamp  time.Time `json:"lastUpdatedTimestamp"`
-	Products              []Product `json:"products,omitempty"`
-	LastPurchaseProductID string    `json:"lastPurchaseProductID,omitempty"`
+	ID                    string              `json:"id"`
+	State                 VendingMachineState `json:"state"`
+	LastUpdatedTimestamp  time.Time           `json:"lastUpdatedTimestamp"`
+	Products              []Product           `json:"products,omitempty"`
+	LastPurchaseProductID string              `json:"lastPurchaseProductId,omitempty"`
+	LastPurchasedProduct  *Product            `json:"lastPurchasedProduct,omitempty"`
 }
 
+func (m *VendingMachine) SetProducts(products []Product) {
+	m.Products = products
+	for _, p := range m.Products {
+		if p.ProductID == m.LastPurchaseProductID {
+			// &p is reference to a copy of the data stored in the array, not the element itself
+			m.LastPurchasedProduct = &p
+		}
+	}
+}
+
+type VendingMachineState string
+
 const (
-	IdleState            = "idle"
-	AwaitingPaymentState = "awaiting_payment"
-	PaymentTimeoutState  = "payment_timeout"
-	DispensingState      = "dispensing"
+	DefaultState         VendingMachineState = ""
+	IdleState            VendingMachineState = "idle"
+	AwaitingPaymentState VendingMachineState = "awaiting_payment"
+	PaymentTimeoutState  VendingMachineState = "payment_timeout"
+	DispensingState      VendingMachineState = "dispensing"
+	OrderCompletedState  VendingMachineState = "order_completed"
 )
 
 const (
-	BuyProductTimeout  = time.Second * 30
-	PostPaymentTimeout = time.Second * 15
+	BuyProductTimeout    = time.Second * 10
+	AfterPaymentTimeout  = time.Second * 5
+	OrderCompleteTimeout = time.Second * 5
 )
 
-var VendingMachineStates = []string{IdleState, AwaitingPaymentState, PaymentTimeoutState, DispensingState}
+type NextScheduledState struct {
+	NextState VendingMachineState
+	Timeout   time.Duration
+}
 
-var StateMachine = map[string][]string{
+func (state NextScheduledState) GetScheduledAt() time.Time {
+	return time.Now().Add(state.Timeout)
+}
+
+var VendingMachineStates = []VendingMachineState{IdleState, AwaitingPaymentState, PaymentTimeoutState, DispensingState, OrderCompletedState}
+
+var StateMachine = map[VendingMachineState][]VendingMachineState{
 	IdleState:            {AwaitingPaymentState},
 	AwaitingPaymentState: {DispensingState, PaymentTimeoutState},
 	PaymentTimeoutState:  {IdleState},
-	DispensingState:      {IdleState},
+	DispensingState:      {OrderCompletedState},
+	OrderCompletedState:  {IdleState},
 }
 
-func IsValidStateTransition(prevState string, nextState string) bool {
+var StateMachineScheduleMap = map[VendingMachineState]NextScheduledState{
+	AwaitingPaymentState: {PaymentTimeoutState, BuyProductTimeout},
+	PaymentTimeoutState:  {IdleState, AfterPaymentTimeout},
+	DispensingState:      {OrderCompletedState, AfterPaymentTimeout},
+	OrderCompletedState:  {IdleState, OrderCompleteTimeout},
+}
+
+func IsValidStateTransition(prevState VendingMachineState, nextState VendingMachineState) bool {
 	if prevState == nextState {
 		return true
 	}
-
 	nextStates, ok := StateMachine[prevState]
 	if !ok {
 		return false
 	}
-
 	return slices.Contains(nextStates, nextState)
+}
+
+func GetNextScheduledState(prevState VendingMachineState) (NextScheduledState, bool) {
+	nextScheduledState, ok := StateMachineScheduleMap[prevState]
+	return nextScheduledState, ok
 }
 
 func MapVendingMachine(rows pgx.Rows) (VendingMachine, error) {
 	var vendingMachineID string
-	var rawState string
+	var state VendingMachineState
 	var lastUpdatedTimestamp time.Time
 	var pendingProductIDPurchase pgtype.Text
 
-	err := rows.Scan(&vendingMachineID, &rawState, &lastUpdatedTimestamp, &pendingProductIDPurchase)
+	err := rows.Scan(&vendingMachineID, &state, &lastUpdatedTimestamp, &pendingProductIDPurchase)
 
-	state := MapVendingMachineStatus(rawState, lastUpdatedTimestamp)
 	return VendingMachine{
 		ID:                    vendingMachineID,
 		State:                 state,
@@ -96,35 +113,6 @@ func UnmarshalVendingMachine(rows pgx.Rows) (VendingMachine, error) {
 	return vendingMachine, nil
 }
 
-func MapVendingMachineStatus(rawState string, lastUpdatedTimestamp time.Time) string {
-	durationSinceUpdate := time.Since(lastUpdatedTimestamp)
-
-	// perform state "overrides" based on lastUpdatedTimestamp to compute "real" state based on time differences rather than use timers/events
-	var vendingMachineState string
-	switch rawState {
-	case IdleState:
-		vendingMachineState = IdleState
-	case AwaitingPaymentState:
-		if durationSinceUpdate > BuyProductTimeout+PostPaymentTimeout {
-			vendingMachineState = IdleState
-		} else if durationSinceUpdate > BuyProductTimeout {
-			vendingMachineState = PaymentTimeoutState
-		} else {
-			vendingMachineState = AwaitingPaymentState
-		}
-	case DispensingState:
-		if durationSinceUpdate > PostPaymentTimeout {
-			vendingMachineState = IdleState
-		} else {
-			vendingMachineState = DispensingState
-		}
-	default:
-		vendingMachineState = "unknown"
-	}
-
-	return vendingMachineState
-}
-
 type Product struct {
 	ProductID string  `json:"productId"`
 	Name      string  `json:"name"`
@@ -138,120 +126,46 @@ func MapProduct(rows pgx.Rows) (Product, error) {
 	return p, err
 }
 
-func (repo *VendingMachineRepo) InsertVendingMachine(ctx context.Context, vendingMachineID string) (VendingMachine, error) {
-	vendingMachine := VendingMachine{
-		ID:                   vendingMachineID,
-		State:                IdleState,
-		LastUpdatedTimestamp: time.Now(),
-	}
-
-	// language=SQL
-	query := `INSERT INTO vending_machines (vending_machine_id, machine_state, last_updated_timestamp) VALUES ($1, $2, $3)`
-	_, err := repo.database.Exec(ctx, query, vendingMachine.ID, vendingMachine.State, vendingMachine.LastUpdatedTimestamp)
-	if err != nil {
-		return VendingMachine{}, fmt.Errorf("insert vending machine: %w", err)
-	}
-
-	return vendingMachine, nil
+type VendingMachineUpdate struct {
+	VendingMachineID string              `json:"vendingMachineID"`
+	NextState        VendingMachineState `json:"nextState"`
+	ProductID        string              `json:"productID"`
+	ProductChangeSet ProductChangeSet    `json:"productChangeSet"`
 }
 
-var VendingMachineNotFoundError = errors.New("vending machine is could not be found")
-
-func (repo *VendingMachineRepo) InsertManyVendingMachineProducts(ctx context.Context, vendingMachineID string, products []Product) error {
-	var productCopyFromRows [][]any
-	for _, product := range products {
-		productCopyFromRows = append(productCopyFromRows, []any{
-			uuid.NewV7(),
-			vendingMachineID,
-			product.Name,
-			product.Price,
-			product.Qty,
-		})
-	}
-
-	count, err := repo.database.CopyFrom(
-		ctx,
-		pgx.Identifier{"products"},
-		[]string{"product_id", "vending_machine_id", "name", "price", "qty"},
-		pgx.CopyFromRows(productCopyFromRows),
-	)
-	if dbErr := databaseInsertError(err); dbErr == ForeignKeyViolationErr {
-		return VendingMachineNotFoundError
-	}
-	if err != nil {
-		slog.ErrorContext(ctx, "failed to insert products", "error", err)
-		return err
-	}
-
-	slog.InfoContext(ctx, "restocked vending machine", "count", count, "productCopyFromRows", productCopyFromRows)
-	return nil
+type ProductChangeSet struct {
+	Quantity int
 }
 
-func (repo *VendingMachineRepo) getVendingMachineProducts(ctx context.Context, vendingMachineID string) ([]Product, error) {
-	// language=SQL
-	query := `SELECT p.product_id, p.name, p.price, p.qty
-			FROM products p
-			INNER JOIN vending_machines v ON v.vending_machine_id = p.vending_machine_id
-			WHERE v.vending_machine_id = $1`
-
-	rows, err := repo.database.Query(ctx, query, vendingMachineID)
-	if err != nil {
-		return nil, fmt.Errorf("select vending machine products: %w", err)
-	}
-	products, err := UnmarshalRows(rows, MapProduct)
-	if err != nil {
-		return nil, fmt.Errorf("unmarshal product row: %w", err)
-	}
-	return products, nil
-}
-
-func (repo *VendingMachineRepo) getVendingMachine(ctx context.Context, vendingMachineID string) (VendingMachine, error) {
-	// language=SQL
-	query := `SELECT vending_machine_id, machine_state, last_updated_timestamp, last_purchase_product_id
-			FROM vending_machines
-			WHERE vending_machine_id = $1`
-
-	rows, err := repo.database.Query(ctx, query, vendingMachineID)
-	if err != nil {
-		return VendingMachine{}, fmt.Errorf("select vending machine: %w", err)
-	}
-	return UnmarshalVendingMachine(rows)
-}
-
-func (repo *VendingMachineRepo) GetVendingMachine(ctx context.Context, vendingMachineID string) (VendingMachine, error) {
-	eg, egCtx := errgroup.WithContext(ctx)
-
-	var vendingMachine VendingMachine
-	var products []Product
-
-	eg.Go(func() (err error) {
-		vendingMachine, err = repo.getVendingMachine(egCtx, vendingMachineID)
-		return err
-	})
-	eg.Go(func() (err error) {
-		products, err = repo.getVendingMachineProducts(egCtx, vendingMachineID)
-		return err
-	})
-
-	if err := eg.Wait(); err != nil {
-		return VendingMachine{}, err
+func TransformUpdate(currState VendingMachine, updt VendingMachineUpdate) VendingMachineUpdate {
+	// we need to overwrite the productID only when the nextState is idle, otherwise we can just show the last product
+	if currState.State == IdleState {
+		updt.ProductID = ""
 	}
 
-	vendingMachine.Products = products
+	// retain existing productID for cases where it won't come as input
+	if currState.State == OrderCompletedState || currState.State == PaymentTimeoutState {
+		updt.ProductID = currState.LastPurchaseProductID
+	}
 
-	return vendingMachine, nil
+	// drop product quantity of purchased product (when next state will be post-purchase state)
+	if updt.NextState == DispensingState {
+		updt.ProductChangeSet.Quantity = -1
+	}
+
+	return updt
 }
 
 type StateTransitionError struct {
-	PrevState string
-	NextState string
+	PrevState VendingMachineState
+	NextState VendingMachineState
 }
 
 func (err *StateTransitionError) Error() string {
 	if err == nil {
 		return "nil state transition error"
 	}
-	return fmt.Sprintf("state transition from %s to %s is invalid", err.PrevState, err.NextState)
+	return fmt.Sprintf("State transition from %s to %s is invalid", err.PrevState, err.NextState)
 }
 
 type PaymentError struct {
@@ -263,80 +177,51 @@ func (err *PaymentError) Error() string {
 	if err == nil {
 		return "nil payment error"
 	}
-	return fmt.Sprintf("expected payment %s got %s", err.ExpectedProductID, err.ProductID)
+	return fmt.Sprintf("Expected payment %s got %s", err.ExpectedProductID, err.ProductID)
 }
 
-func (repo *VendingMachineRepo) updateVendingMachineTx(ctx context.Context, vendingMachineID string, nextState string, productID string) (VendingMachine, error) {
-	txn, err := repo.database.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.Serializable})
-	if err != nil {
-		return VendingMachine{}, err
-	}
-	defer func() {
-		err := txn.Rollback(context.Background())
-		slog.InfoContext(ctx, "rolling back update vending machine txn", "error", err)
-	}()
-
-	// language=SQL
-	query := `SELECT vending_machine_id, machine_state, last_updated_timestamp, last_purchase_product_id
-			FROM vending_machines
-			WHERE vending_machine_id = $1`
-
-	rows, err := txn.Query(ctx, query, vendingMachineID)
-	if err != nil {
-		return VendingMachine{}, fmt.Errorf("select vending machine: %w", err)
-	}
-	vendingMachine, err := UnmarshalVendingMachine(rows)
-	if err != nil {
-		return VendingMachine{}, err
+func DoStateTransitionValidations(vendingMachine VendingMachine, nextState VendingMachineState, productID string) error {
+	isValidTransition := IsValidStateTransition(vendingMachine.State, nextState)
+	if !isValidTransition {
+		return &StateTransitionError{PrevState: vendingMachine.State, NextState: nextState}
 	}
 
-	slog.InfoContext(ctx, "retrieved state in update vending machine operation", "vendingMachine", vendingMachine)
-
-	if !IsValidStateTransition(vendingMachine.State, nextState) {
-		return vendingMachine, &StateTransitionError{PrevState: vendingMachine.State, NextState: nextState}
-	}
-	if vendingMachine.State == AwaitingPaymentState && vendingMachine.LastPurchaseProductID != productID {
-		return vendingMachine, &PaymentError{ExpectedProductID: vendingMachine.LastPurchaseProductID, ProductID: productID}
+	isPaymentAction := vendingMachine.State == AwaitingPaymentState && nextState == OrderCompletedState
+	// AwaitingPaymentState->: we need to validate the productID being set is equal to the one already in the database
+	if isPaymentAction && vendingMachine.LastPurchaseProductID != productID {
+		return &PaymentError{ExpectedProductID: vendingMachine.LastPurchaseProductID, ProductID: productID}
 	}
 
-	// language=SQL
-	updateQuery := `UPDATE vending_machines 
-			SET machine_state = $2, last_updated_timestamp = $3, last_purchase_product_id = $4
-			WHERE vending_machine_id = $1;`
-	updateArgs := []any{vendingMachineID, nextState, time.Now(), pgtype.Text{String: productID, Valid: productID != ""}}
-
-	_, err = txn.Exec(ctx, updateQuery, updateArgs...)
-	if err != nil {
-		return VendingMachine{}, fmt.Errorf("update vending machine state: %w", err)
-	}
-
-	if err := txn.Commit(ctx); err != nil {
-		return VendingMachine{}, err
-	}
-
-	// apply state change on selected previous state
-	vendingMachine.State = nextState
-	vendingMachine.LastPurchaseProductID = productID
-
-	slog.InfoContext(ctx, "finished update vending machine operation", "vendingMachine", vendingMachine, "updateArgs", updateArgs)
-	return vendingMachine, err
+	return nil
 }
 
-func (repo *VendingMachineRepo) DoVendingMachineUpdate(ctx context.Context, vendingMachineID string, nextState string, productID string) (VendingMachine, error) {
-	slog.InfoContext(ctx, "begin vending machine update", "vendingMachineID", vendingMachineID, "productID", productID, "nextState", nextState)
+type PostConditionErrorKind int
 
-	vendingMachine, err := repo.updateVendingMachineTx(ctx, vendingMachineID, nextState, productID)
-	if err != nil {
-		return vendingMachine, err
+const (
+	PurchaseQtyKind PostConditionErrorKind = 0
+)
+
+type UpdatePostConditionError struct {
+	Kind      PostConditionErrorKind
+	ProductID string
+}
+
+func (err *UpdatePostConditionError) Error() string {
+	if err == nil {
+		return "nil update post condition error"
 	}
-
-	// getVendingMachineProducts is done outside a transaction, we're not necessarily expecting it to be consistent in regard to the update, just get the latest products
-	products, err := repo.getVendingMachineProducts(ctx, vendingMachineID)
-	if err != nil {
-		return VendingMachine{}, err
+	switch err.Kind {
+	case PurchaseQtyKind:
+		return fmt.Sprintf("PostCondition: not enough product in stock for productID=%s", err.ProductID)
+	default:
+		return "unknown update post condition error"
 	}
-	vendingMachine.Products = products
+}
 
-	slog.InfoContext(ctx, "selected products after update vending machine operation", "vendingMachine", vendingMachine)
-	return vendingMachine, nil
+func DoPostUpdateValidations(vendingMachine VendingMachine, product Product) error {
+	// client is supposed to check these before they call, but this prevents invalid state
+	if product.Qty < 0 {
+		return &UpdatePostConditionError{ProductID: product.ProductID}
+	}
+	return nil
 }

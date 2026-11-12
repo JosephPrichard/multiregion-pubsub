@@ -30,16 +30,18 @@ func (publisher *EventsPublisher) Publish(ctx context.Context, channel string, e
 		go func() {
 			message, err := json.Marshal(event)
 			if err != nil {
-				slog.ErrorContext(ctx, "failed marshal pubsub event", err)
+				slog.ErrorContext(ctx, "failed marshal pubsub event", "error", err)
 				return
 			}
+			strMessage := string(message)
 
 			// error is just logged, this operation is fire and forget - rely on redisClient retries to reduce dropped message rate
 			recvCount, err := redisClient.Publish(channel, message).Result()
 			if err != nil {
-				slog.ErrorContext(ctx, "failed to publish a pubsub event", err)
+				slog.ErrorContext(ctx, "failed to publish a pubsub event", "error", err, "redisClient", redisClient)
 			} else {
-				slog.InfoContext(ctx, "sent pubsub event successfully", "recvCount", recvCount, "channel", channel)
+				slog.InfoContext(ctx, "sent pubsub event successfully",
+					"recvCount", recvCount, "channel", channel, "message", strMessage, "redisClient", redisClient)
 			}
 		}()
 	}
