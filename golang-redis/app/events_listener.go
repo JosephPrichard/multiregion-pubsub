@@ -87,7 +87,8 @@ func (listener *EventsListener) publish(vendingMachineID string, event OutputEve
 
 	var indicesToRemove []int
 
-	for index, subscriber := range subscribers {
+	for index := range subscribers {
+		subscriber := &subscribers[index]
 		select {
 		case subscriber.mailbox <- event:
 			subscriber.lastSendTime = time.Now()
