@@ -90,6 +90,7 @@ func (listener *EventsListener) publish(vendingMachineID string, event OutputEve
 	for index, subscriber := range subscribers {
 		select {
 		case subscriber.mailbox <- event:
+			subscriber.lastSendTime = time.Now()
 		default:
 			// don't block in case of back-pressure (slow consumer), just drop
 			// if we had to drop AND it has been awhile since the last send was successful, mark this subscriber for removal
